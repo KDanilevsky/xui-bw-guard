@@ -28,9 +28,11 @@ banner(){
     printf "%b\n" "$c_bold$c_mag"
     cat <<'BANNER'
    ____      _       _       _                                _
+
   |___ \_  _(_)_   _| |_____| |__ __      __       __ _ _   _| |
     __) \ \/ / | | | | |_  / | '_ \\ \ /\ / /_____ / _` | | | | |
    / __/ >  <| | |_| | |/ /| | |_) |\ V  V /_____| (_| | |_| | |
+
   |_____/_/\_\_|\__,_|_/___|_|_.__/  \_/\_/       \__, |\__, |_|
                                                    |___/ |___/
 BANNER
@@ -81,7 +83,6 @@ is_valid_ipv4(){
 }
 
 is_valid_ipv6(){ [[ "$1" =~ ^[0-9A-Fa-f:]+$ ]]; }
-
 is_valid_ip(){ is_valid_ipv4 "$1" || is_valid_ipv6 "$1"; }
 
 rate_to_bps(){
@@ -177,6 +178,8 @@ STRICT_R2Q="1"
 STRICT_QUANTUM="1514"
 DEBUG_BYPASS_WARN_RATIO="0.30"
 LOG_LEVEL="info"
+
+USE_DYNAMIC_JSON="no"
 CFG
 }
 
@@ -209,17 +212,17 @@ install_deps(){
   if cmd_exists apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
-    apt-get install -y iproute2 nftables conntrack jq ethtool kmod iptables >/dev/null
+    apt-get install -y iproute2 nftables conntrack jq ethtool kmod iptables sqlite3 >/dev/null
   elif cmd_exists dnf; then
-    dnf install -y iproute nftables conntrack-tools jq ethtool kmod iptables >/dev/null
+    dnf install -y iproute nftables conntrack-tools jq ethtool kmod iptables sqlite3 >/dev/null
   elif cmd_exists yum; then
-    yum install -y iproute nftables conntrack-tools jq ethtool kmod iptables >/dev/null
+    yum install -y iproute nftables conntrack-tools jq ethtool kmod iptables sqlite3 >/dev/null
   elif cmd_exists pacman; then
-    pacman -Sy --noconfirm iproute2 nftables conntrack-tools jq ethtool kmod iptables >/dev/null
+    pacman -Sy --noconfirm iproute2 nftables conntrack-tools jq ethtool kmod iptables sqlite3 >/dev/null
   elif cmd_exists zypper; then
-    zypper --non-interactive install iproute2 nftables conntrack-tools jq ethtool kmod iptables >/dev/null
+    zypper --non-interactive install iproute2 nftables conntrack-tools jq ethtool kmod iptables sqlite3 >/dev/null
   else
-    warn "Install dependencies manually: iproute2 nftables conntrack-tools jq ethtool kmod iptables"
+    warn "Install dependencies manually: iproute2 nftables conntrack-tools jq ethtool kmod iptables sqlite3"
   fi
 }
 
@@ -252,15 +255,17 @@ load_config(){
   STRICT_QUANTUM="${STRICT_QUANTUM:-1514}"
   DEBUG_BYPASS_WARN_RATIO="${DEBUG_BYPASS_WARN_RATIO:-0.30}"
   LOG_LEVEL="${LOG_LEVEL:-info}"
+  USE_DYNAMIC_JSON="${USE_DYNAMIC_JSON:-no}"
 }
 
 log_debug(){ [[ "${LOG_LEVEL,,}" == "debug" ]] && info "$*" || true; }
 
+
 detect_iface(){
   if [[ "$IFACE" != "auto" && -n "$IFACE" ]]; then printf '%s' "$IFACE"; return 0; fi
   local d
-  d="$(ip -o route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
-  [[ -z "$d" ]] && d="$(ip -o route show default 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+  d="$(ip -o route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<==NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+  [[ -z "$d" ]] && d="$(ip -o route show default 2>/dev/null | awk '/default/ {for(i=1;i<==NF;i++) if($i=="dev") {print $(i+1); exit}}')"
   [[ -n "$d" ]] || { error "Could not auto-detect interface. Set IFACE manually."; exit 1; }
   printf '%s' "$d"
 }
@@ -371,19 +376,14 @@ setup_qdisc(){
 
 detect_iface_safe(){
   local d=""
-
   if [[ -n "${IFACE:-}" && "${IFACE:-}" != "auto" ]]; then
-    [[ -d "/sys/class/net/${IFACE}" ]] && printf '%s
-' "$IFACE"
+    [[ -d "/sys/class/net/${IFACE}" ]] && printf '%s\n' "$IFACE"
     return 0
   fi
-
-  d="$(ip -o route show default 2>/dev/null | awk '/default/ { for (i=1; i<=NF; i++) if ($i=="dev") { print $(i+1); exit } }' || true)"
+  d="$(ip -o route show default 2>/dev/null | awk '/default/ { for (i=1; i<==NF; i++) if ($i=="dev") { print $(i+1); exit } }' || true)"
   if [[ -n "$d" && -d "/sys/class/net/$d" ]]; then
-    printf '%s
-' "$d"
+    printf '%s\n' "$d"
   fi
-
   return 0
 }
 
@@ -391,18 +391,15 @@ cleanup_qdisc(){
   local iface="" ifb=""
   iface="$(detect_iface_safe)"
   ifb="${INGRESS_IFB:-ifb3xui0}"
-
   if [[ -n "$iface" ]]; then
     tc qdisc del dev "$iface" ingress 2>/dev/null || true
     tc qdisc del dev "$iface" root 2>/dev/null || true
   fi
-
   if ip link show "$ifb" >/dev/null 2>&1; then
     tc qdisc del dev "$ifb" root 2>/dev/null || true
     ip link set dev "$ifb" down 2>/dev/null || true
     ip link delete "$ifb" type ifb 2>/dev/null || true
   fi
-
   return 0
 }
 
@@ -581,29 +578,55 @@ remove_client_filters(){
   tc class del dev "$EFFECTIVE_IFACE" classid "1:${minor}" 2>/dev/null || true
   tc class del dev "$INGRESS_IFB" classid "2:${minor}" 2>/dev/null || true
 }
-
 add_client_filters(){
   local ip="$1" family minor port proto handle class_opts=()
   is_valid_ip "$ip" || return 0
   minor="$(hash_minor_hex "$ip")"
   [[ -n "$CLASS_QUANTUM" ]] && class_opts+=(quantum "$CLASS_QUANTUM")
-  if [[ "$LIMIT_DOWN" != "0" && "$LIMIT_DOWN" != "off" && "$LIMIT_DOWN" != "none" ]]; then
-    tc class replace dev "$EFFECTIVE_IFACE" parent 1:1 classid "1:${minor}" htb rate "$LIMIT_DOWN" ceil "$LIMIT_DOWN" burst "$DOWN_BURST" cburst "$DOWN_BURST" prio 1 "${class_opts[@]}"
+
+  # --- НАЧАЛО НАШЕЙ JSON-ЛОГИКИ ШЕЙПИНГА ---
+  local effective_down="$LIMIT_DOWN"
+  local effective_up="$LIMIT_UP"
+
+  if [[ "${USE_DYNAMIC_JSON:-no}" == "yes" ]]; then
+    local db_file="/etc/x-ui/x-ui.db"
+    [[ -f "/etc/x-ui-db/x-ui.db" ]] && db_file="/etc/x-ui-db/x-ui.db"
+    [[ -f "/usr/local/x-ui/db/x-ui.db" ]] && db_file="/usr/local/x-ui/db/x-ui.db"
+    [[ -f "/var/lib/x-ui/x-ui.db" ]] && db_file="/var/lib/x-ui/x-ui.db"
+
+    if [[ -f "$db_file" ]]; then
+      local user_note
+      user_note=$(sqlite3 "$db_file" "SELECT note FROM client_traffics WHERE ips LIKE '%$ip%' LIMIT 1;" 2>/dev/null || true)
+      
+      if echo "$user_note" | jq -e . >/dev/null 2>&1; then
+        local ext_spd
+        ext_spd=$(echo "$user_note" | jq -r '.speed')
+        if [[ "$ext_spd" =~ ^[0-9]+$ ]]; then
+          effective_down="${ext_spd}mbit"
+          effective_up="${ext_spd}mbit"
+        fi
+      fi
+    fi
+  fi
+  # --- КОНЕЦ НАШЕЙ JSON-ЛОГИКИ ---
+
+  if [[ "$effective_down" != "0" && "$effective_down" != "off" && "$effective_down" != "none" ]]; then
+    tc class replace dev "$EFFECTIVE_IFACE" parent 1:1 classid "1:${minor}" htb rate "$effective_down" ceil "$effective_down" burst "$DOWN_BURST" cburst "$DOWN_BURST" prio 1 "${class_opts[@]}"
     tc qdisc replace dev "$EFFECTIVE_IFACE" parent "1:${minor}" fq_codel
   fi
-  if [[ "$LIMIT_UP" != "0" && "$LIMIT_UP" != "off" && "$LIMIT_UP" != "none" ]]; then
-    tc class replace dev "$INGRESS_IFB" parent 2:1 classid "2:${minor}" htb rate "$LIMIT_UP" ceil "$LIMIT_UP" burst "$UP_BURST" cburst "$UP_BURST" prio 1 "${class_opts[@]}"
+  if [[ "$effective_up" != "0" && "$effective_up" != "off" && "$effective_up" != "none" ]]; then
+    tc class replace dev "$INGRESS_IFB" parent 2:1 classid "2:${minor}" htb rate "$effective_up" ceil "$effective_up" burst "$UP_BURST" cburst "$UP_BURST" prio 1 "${class_opts[@]}"
     tc qdisc replace dev "$INGRESS_IFB" parent "2:${minor}" fq_codel
   fi
   if is_ipv4 "$ip"; then family="ip"; else family="ipv6"; fi
   for port in "${PORTS[@]}"; do
     for proto in tcp udp; do
-      if [[ "$LIMIT_DOWN" != "0" && "$LIMIT_DOWN" != "off" && "$LIMIT_DOWN" != "none" ]]; then
+      if [[ "$effective_down" != "0" && "$effective_down" != "off" && "$effective_down" != "none" ]]; then
         handle="$(hash_handle_hex "egress|$family|$proto|$port|$ip")"
         tc filter replace dev "$EFFECTIVE_IFACE" parent 1: protocol "$family" pref 100 handle "$handle" flower ${HW_OPT:+$HW_OPT} \
           dst_ip "$ip" ip_proto "$proto" src_port "$port" classid "1:${minor}" >/dev/null 2>&1 || true
       fi
-      if [[ "$LIMIT_UP" != "0" && "$LIMIT_UP" != "off" && "$LIMIT_UP" != "none" ]]; then
+      if [[ "$effective_up" != "0" && "$effective_up" != "off" && "$effective_up" != "none" ]]; then
         handle="$(hash_handle_hex "ingress|$family|$proto|$port|$ip")"
         tc filter replace dev "$INGRESS_IFB" parent 2: protocol "$family" pref 100 handle "$handle" flower ${HW_OPT:+$HW_OPT} \
           src_ip "$ip" ip_proto "$proto" dst_port "$port" classid "2:${minor}" >/dev/null 2>&1 || true
@@ -968,6 +991,10 @@ cmd_wizard(){
   read -r -p "Strict r2q [${STRICT_R2Q}]: " v; STRICT_R2Q="${v:-$STRICT_R2Q}"
   read -r -p "Strict quantum [${STRICT_QUANTUM}]: " v; STRICT_QUANTUM="${v:-$STRICT_QUANTUM}"
   read -r -p "Log level info/debug [${LOG_LEVEL}]: " v; LOG_LEVEL="${v:-$LOG_LEVEL}"
+
+  # Интерактивный вопрос для нашей переменной в визарде
+  read -r -p "Enable multi-node dynamic JSON speed limit yes/no [${USE_DYNAMIC_JSON}]: " v; USE_DYNAMIC_JSON="${v:-$USE_DYNAMIC_JSON}"
+
   cat > "$CONF_FILE" <<CFG
 # Bash syntax only. Comments must start with #
 IFACE="${IFACE}"
@@ -994,6 +1021,10 @@ STRICT_R2Q="${STRICT_R2Q}"
 STRICT_QUANTUM="${STRICT_QUANTUM}"
 DEBUG_BYPASS_WARN_RATIO="${DEBUG_BYPASS_WARN_RATIO}"
 LOG_LEVEL="${LOG_LEVEL}"
+
+# Сохраняем состояние нашего JSON мода
+USE_DYNAMIC_JSON="${USE_DYNAMIC_JSON}"
+
 CFG
   success "Saved configuration to $CONF_FILE"
   configtest
@@ -1054,5 +1085,7 @@ case "${1:-}" in
 Usage: $0 {install|update|uninstall|enable|disable|start|stop|restart|status|configtest|config|clients [--fresh]|hits|debug|doctor|wizard|logs|flush|run-daemon|stop-runtime}
 USAGE
     exit 1
+    ;;
+esac
     ;;
 esac
