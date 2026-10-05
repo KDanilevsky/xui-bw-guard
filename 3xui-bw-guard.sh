@@ -435,6 +435,66 @@ load_exempt_set(){
   for ip in "${CSV_ITEMS[@]:-}"; do EXEMPT_SET["$ip"]=1; done
 }
 
+declare -gA SPEED_CACHE=()
+CACHE_TS=0
+CACHE_TTL=60
+
+reload_speed_cache() {
+    local now db_file speed ips note ip
+
+    now=$(date +%s)
+
+    if (( now - CACHE_TS < CACHE_TTL )); then
+        return 0
+    fi
+
+    CACHE_TS="$now"
+    SPEED_CACHE=()
+
+    db_file="/etc/x-ui/x-ui.db"
+
+    [[ -f "/etc/x-ui-db/x-ui.db" ]] && db_file="/etc/x-ui-db/x-ui.db"
+    [[ -f "/usr/local/x-ui/db/x-ui.db" ]] && db_file="/usr/local/x-ui/db/x-ui.db"
+    [[ -f "/var/lib/x-ui/x-ui.db" ]] && db_file="/var/lib/x-ui/x-ui.db"
+
+    [[ -f "$db_file" ]] || return 0
+
+    while IFS='|' read -r ips note; do
+
+        [[ -z "$ips" ]] && continue
+
+        speed="$(jq -r '.speed // empty' <<< "$note" 2>/dev/null || true)"
+
+        [[ "$speed" =~ ^[0-9]+$ ]] || continue
+
+        IFS=',' read -ra IP_LIST <<< "$ips"
+
+        for ip in "${IP_LIST[@]}"; do
+            ip="$(trim "$ip")"
+            [[ -n "$ip" ]] || continue
+
+            SPEED_CACHE["$ip"]="${speed}mbit"
+        done
+
+    done < <(
+        sqlite3 "$db_file" \
+        "SELECT ips,note FROM client_traffics;"
+    )
+}
+
+get_client_speed() {
+    local ip="$1"
+
+    reload_speed_cache
+
+    [[ -n "${SPEED_CACHE[$ip]:-}" ]] && {
+        echo "${SPEED_CACHE[$ip]}"
+        return 0
+    }
+
+    return 1
+}
+
 client_is_exempt(){ [[ -n "${EXEMPT_SET[$1]:-}" ]]; }
 
 fresh_collect_current_clients(){
@@ -589,29 +649,26 @@ add_client_filters(){
   local effective_up="$LIMIT_UP"
 
   if [[ "${USE_DYNAMIC_JSON:-no}" == "yes" ]]; then
-    local db_file="/etc/x-ui/x-ui.db"
-    [[ -f "/etc/x-ui-db/x-ui.db" ]] && db_file="/etc/x-ui-db/x-ui.db"
-    [[ -f "/usr/local/x-ui/db/x-ui.db" ]] && db_file="/usr/local/x-ui/db/x-ui.db"
-    [[ -f "/var/lib/x-ui/x-ui.db" ]] && db_file="/var/lib/x-ui/x-ui.db"
 
-    if [[ -f "$db_file" ]]; then
-      local user_note
-      user_note=$(sqlite3 "$db_file" "SELECT note FROM client_traffics WHERE ips LIKE '%$ip%' LIMIT 1;" 2>/dev/null || true)
-      
-      if echo "$user_note" | jq -e . >/dev/null 2>&1; then
-        local ext_spd
-        ext_spd=$(echo "$user_note" | jq -r '.speed')
-        if [[ "$ext_spd" =~ ^[0-9]+$ ]]; then
-          effective_down="${ext_spd}mbit"
-          effective_up="${ext_spd}mbit"
-        fi
+      local speed=""
+      speed="$(get_client_speed "$ip" || true)"
+  
+      if [[ -n "$speed" ]]; then
+          effective_down="$speed"
+          effective_up="$speed"
       fi
-    fi
+  
   fi
+
+  local effective_down_burst
+  local effective_up_burst
+   
+  effective_down_burst="$(compute_burst "$effective_down" "$BURST_INTERVAL_MS")"
+  effective_up_burst="$(compute_burst "$effective_up" "$BURST_INTERVAL_MS")"
   # --- КОНЕЦ НАШЕЙ JSON-ЛОГИКИ ---
 
   if [[ "$effective_down" != "0" && "$effective_down" != "off" && "$effective_down" != "none" ]]; then
-    tc class replace dev "$EFFECTIVE_IFACE" parent 1:1 classid "1:${minor}" htb rate "$effective_down" ceil "$effective_down" burst "$DOWN_BURST" cburst "$DOWN_BURST" prio 1 "${class_opts[@]}"
+    tc class replace dev "$EFFECTIVE_IFACE" parent 1:1 classid "1:${minor}" htb rate "$effective_down" ceil "$effective_down" burst "$effective_down_burst" cburst "$effective_down_burst" prio 1 "${class_opts[@]}"
     tc qdisc replace dev "$EFFECTIVE_IFACE" parent "1:${minor}" fq_codel
   fi
   if [[ "$effective_up" != "0" && "$effective_up" != "off" && "$effective_up" != "none" ]]; then
